@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-STM32Cube.AI friendly ONNX export with NEW confidence definition (MC consistency):
+STM32Cube.AI friendly ONNX export with MC-dropout confidence
+and position-distance-based alpha label.
 
 Input (float32, shape=(1,5)):
   [sx, sy, vavg, dsx, dsy]
@@ -8,18 +9,17 @@ Input (float32, shape=(1,5)):
 Output (float32, shape=(1,4)):
   y = [dir_x, dir_y, alpha, c]
 
-Confidence definition (training target):
-  Run M stochastic predictions (dropout + small input noise) for same input:
-    u_hat_j -> normalize -> u_tilde_j
-  C = || mean_j(u_tilde_j) ||_2
-
-Deployment:
-  MCU does single forward pass. We train a confidence head c_head to regress C.
+Key revision:
+- alpha supervision label is now aligned with the manuscript:
+    alpha* = min(||p* - pk||, alpha_max)
+- Here pk = current sampled position, p* = target alignment position.
+- By default, simulation coordinates are read in mm and alpha is generated in cm.
+- Default alpha_max = 3.0 cm.
 
 Export constraints for X-CUBE-AI 10.2.0:
 - opset_version = 13
 - ONNX ir_version forced to 9
-- static shapes (no dynamic axes)
+- static shapes
 - single output tensor y (B,4)
 """
 
@@ -31,7 +31,7 @@ import argparse
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -43,7 +43,7 @@ from torch.utils.data import Dataset, DataLoader
 
 
 # -----------------------------
-# 1) Parse Serial Debug CSV (逗号/空格兼容)
+# 1) Parse Serial Debug CSV
 # -----------------------------
 def parse_serial_debug(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
@@ -61,7 +61,9 @@ def parse_serial_debug(path: str) -> pd.DataFrame:
     p_head_space = re.compile(
         r"Loc\(x y\):\s*([-\d.]+)\s+([-\d.]+)\s+ADC\(V\):\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)"
     )
-    p_tail_space = re.compile(r"^\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*$")
+    p_tail_space = re.compile(
+        r"^\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s*$"
+    )
 
     rows = []
     cur_x, cur_y = None, None
@@ -95,19 +97,17 @@ def parse_serial_debug(path: str) -> pd.DataFrame:
 
 
 # -----------------------------
-# 1b) 解析仿真 CSV（R=140三维.csv）
+# 1b) Parse simulation CSV
 # -----------------------------
 def parse_sim_csv(path: str) -> pd.DataFrame:
     """
-    期望的列名（你当前文件的表头就是这种格式）：
+    Expected columns in your simulation CSV:
       - x:  "DXX [mm]"
       - y:  "DYY [mm]"
       - v1: "L(RX,jc1) [uH]"
       - v2: "L(RX,jc2) [uH]"
       - v3: "L(RX,jc3) [uH]"
       - v4: "L(RX,jc4) [uH]"
-
-    如果你的仿真列名有变化，只需要改下面 col_map 即可。
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Sim CSV not found: {path}")
@@ -125,7 +125,7 @@ def parse_sim_csv(path: str) -> pd.DataFrame:
     missing = [k for k, v in col_map.items() if v not in df.columns]
     if missing:
         raise RuntimeError(
-            "仿真CSV缺少必要列: " + str(missing) + "\n" + "当前表头: " + str(list(df.columns))
+            "仿真CSV缺少必要列: " + str(missing) + "\n当前表头: " + str(list(df.columns))
         )
 
     out = pd.DataFrame(
@@ -147,28 +147,31 @@ def build_grid(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def finite_difference_gradient(grid: pd.DataFrame, field_col: str = "vavg") -> pd.DataFrame:
-    F_map: Dict[Tuple[float, float], float] = {
-        (row.x, row.y): float(getattr(row, field_col)) for row in grid.itertuples(index=False)
+    f_map: Dict[Tuple[float, float], float] = {
+        (row.x, row.y): float(getattr(row, field_col))
+        for row in grid.itertuples(index=False)
     }
+
     xs = np.sort(grid["x"].unique())
     ys = np.sort(grid["y"].unique())
     dx = np.median(np.diff(xs)) if len(xs) > 1 else 1.0
     dy = np.median(np.diff(ys)) if len(ys) > 1 else 1.0
+
     if not np.isfinite(dx) or dx == 0:
         dx = 1.0
     if not np.isfinite(dy) or dy == 0:
         dy = 1.0
 
-    def getF(x, y):
-        return F_map.get((x, y), None)
+    def getf(x, y):
+        return f_map.get((x, y), None)
 
     grads = []
     for row in grid.itertuples(index=False):
         x, y = float(row.x), float(row.y)
         f0 = float(row.vavg)
 
-        f_l = getF(x - dx, y)
-        f_r = getF(x + dx, y)
+        f_l = getf(x - dx, y)
+        f_r = getf(x + dx, y)
         if f_l is not None and f_r is not None:
             dfdx = (f_r - f_l) / (2.0 * dx)
         elif f_r is not None:
@@ -178,8 +181,8 @@ def finite_difference_gradient(grid: pd.DataFrame, field_col: str = "vavg") -> p
         else:
             dfdx = 0.0
 
-        f_d = getF(x, y - dy)
-        f_u = getF(x, y + dy)
+        f_d = getf(x, y - dy)
+        f_u = getf(x, y + dy)
         if f_d is not None and f_u is not None:
             dfdy = (f_u - f_d) / (2.0 * dy)
         elif f_u is not None:
@@ -199,8 +202,8 @@ def finite_difference_gradient(grid: pd.DataFrame, field_col: str = "vavg") -> p
 
 def compute_features(grid: pd.DataFrame) -> pd.DataFrame:
     """
-    默认假设：v1=Left, v2=Right, v3=Down, v4=Up
-    若线圈编号不同，改 sx/sy 两行。
+    Default assumption:
+      v1=Left, v2=Right, v3=Down, v4=Up
     """
     out = grid.copy()
     out["sx"] = out["v2"] - out["v1"]
@@ -213,20 +216,59 @@ def compute_features(grid: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def compute_step_label(df: pd.DataFrame, step_min=0.1, step_max=2.0) -> pd.Series:
+# -----------------------------
+# 2) Alpha label aligned with manuscript
+# -----------------------------
+def compute_step_label_from_position(
+    df: pd.DataFrame,
+    target_x: float = 0.0,
+    target_y: float = 0.0,
+    alpha_max_cm: float = 3.0,
+    coord_unit: str = "mm",
+) -> pd.Series:
     """
-    这里仍是启发式 α 标签。你如果论文里有明确 α 公式，可替换这里。
+    alpha* = min(||p* - pk||, alpha_max)
+
+    Parameters
+    ----------
+    df : DataFrame
+        Must contain columns ["x", "y"].
+    target_x, target_y : float
+        Target alignment position p* in the SAME unit as x,y.
+    alpha_max_cm : float
+        Max step size in cm, consistent with manuscript.
+    coord_unit : str
+        "mm" or "cm". Simulation CSV usually uses mm.
+
+    Returns
+    -------
+    pd.Series
+        alpha label in cm.
     """
-    v = df["vavg"].to_numpy(dtype=np.float64)
-    vmin, vmax = float(np.min(v)), float(np.max(v))
-    vnorm = np.zeros_like(v) if vmax - vmin < 1e-9 else (v - vmin) / (vmax - vmin)
-    alpha = (1.0 - vnorm) * step_max + step_min
-    alpha = np.clip(alpha, step_min, step_max)
-    return pd.Series(alpha.astype(np.float32))
+    if "x" not in df.columns or "y" not in df.columns:
+        raise ValueError("compute_step_label_from_position requires x and y columns.")
+
+    x = df["x"].to_numpy(dtype=np.float64)
+    y = df["y"].to_numpy(dtype=np.float64)
+
+    dist = np.sqrt((x - target_x) ** 2 + (y - target_y) ** 2)
+
+    unit = coord_unit.strip().lower()
+    if unit == "mm":
+        dist_cm = dist / 10.0
+    elif unit == "cm":
+        dist_cm = dist
+    else:
+        raise ValueError(f"Unsupported coord_unit: {coord_unit}. Use 'mm' or 'cm'.")
+
+    alpha = np.minimum(dist_cm, float(alpha_max_cm))
+    alpha = np.maximum(alpha, 0.0)
+
+    return pd.Series(alpha.astype(np.float32), name="alpha_gt_cm")
 
 
 # -----------------------------
-# 归一化
+# Normalization
 # -----------------------------
 @dataclass
 class NormStats:
@@ -246,7 +288,7 @@ def apply_norm(X: np.ndarray, stats: NormStats) -> np.ndarray:
 
 
 # -----------------------------
-# Dataset：y_gt 先只放 [dirx,diry,alpha]，c 由 MC 生成
+# Dataset
 # -----------------------------
 class AlignDatasetA(Dataset):
     def __init__(self, X: np.ndarray, dir_gt: np.ndarray, alpha_gt: np.ndarray):
@@ -274,7 +316,7 @@ class AlignDatasetB(Dataset):
 
 
 # -----------------------------
-# 模型：输出 y=(B,4) 但训练分阶段
+# Model
 # -----------------------------
 class AlignNetY4_MC(nn.Module):
     def __init__(self, in_dim=5, hidden=32, dropout_p=0.15):
@@ -289,16 +331,16 @@ class AlignNetY4_MC(nn.Module):
 
     def trunk(self, x):
         h = torch.relu(self.fc1(x))
-        h = self.drop(h)          # ★用于 MC 置信度
+        h = self.drop(h)
         h = torch.relu(self.fc2(h))
-        h = self.drop(h)          # ★用于 MC 置信度
+        h = self.drop(h)
         return h
 
     def forward_dir_alpha(self, x):
         """
-        只产生方向与步长（用于 Stage-A 训练、以及 Stage-B 计算 MC 置信度）
-        返回：
-          dir_unit (B,2), alpha (B,1)
+        Returns:
+          dir_unit: (B,2)
+          alpha:    (B,1), in cm
         """
         h = self.trunk(x)
 
@@ -307,19 +349,13 @@ class AlignNetY4_MC(nn.Module):
         norm = torch.sqrt((dir_raw * dir_raw).sum(dim=-1, keepdim=True) + eps)
         dir_unit = dir_raw / norm
 
-        alpha = torch.relu(self.head_alpha(h))  # >=0（Cube.AI 友好）
-
+        alpha = torch.relu(self.head_alpha(h))
         return dir_unit, alpha
 
     def forward(self, x):
-        """
-        最终输出 y = [dirx, diry, alpha, c]
-        注意：部署时 dropout 关闭（model.eval()）
-        """
         dir_unit, alpha = self.forward_dir_alpha(x)
-        # c 头：训练时回归 MC 计算得到的 C_target
-        c = torch.sigmoid(self.head_conf(self.trunk(x)))  # (B,1)
-        y = torch.cat([dir_unit, alpha, c], dim=-1)       # (B,4)
+        c = torch.sigmoid(self.head_conf(self.trunk(x)))
+        y = torch.cat([dir_unit, alpha, c], dim=-1)
         return y
 
 
@@ -327,7 +363,6 @@ class AlignNetY4_MC(nn.Module):
 # Loss
 # -----------------------------
 def loss_stage_a(dir_pred, alpha_pred, dir_gt, alpha_gt, w_dir=1.0, w_alpha=0.3):
-    # 方向：cosine loss
     cos = (dir_pred * dir_gt).sum(dim=-1).clamp(-1.0, 1.0)
     l_dir = (1.0 - cos).mean()
     l_alpha = F.mse_loss(alpha_pred.squeeze(-1), alpha_gt)
@@ -339,39 +374,43 @@ def loss_stage_b(c_pred, c_target):
 
 
 # -----------------------------
-# 新置信度定义：MC 一致性
+# MC confidence
 # -----------------------------
 @torch.no_grad()
-def mc_confidence_C(model: AlignNetY4_MC,
-                    x: torch.Tensor,
-                    M: int = 16,
-                    noise_std: float = 0.02,
-                    noise_clip: float = 0.06) -> torch.Tensor:
+def mc_confidence_C(
+    model: AlignNetY4_MC,
+    x: torch.Tensor,
+    M: int = 16,
+    noise_std: float = 0.02,
+    noise_clip: float = 0.06,
+) -> torch.Tensor:
     """
     C = || mean_j( u_tilde_j ) ||_2
-    返回：(B,) in [0,1]
+    Returns: (B,) in [0,1]
     """
-    model.train()  # 让 dropout 生效
+    model.train()
     u_list = []
+
     for _ in range(M):
         n = torch.randn_like(x) * noise_std
         n = torch.clamp(n, -noise_clip, noise_clip)
         x_pert = x + n
-        dir_unit, _alpha = model.forward_dir_alpha(x_pert)  # (B,2)
+        dir_unit, _alpha = model.forward_dir_alpha(x_pert)
+
         eps = 1e-8
         norm = torch.sqrt((dir_unit * dir_unit).sum(dim=-1, keepdim=True) + eps)
         u_tilde = dir_unit / norm
         u_list.append(u_tilde)
 
-    U = torch.stack(u_list, dim=0)           # (M,B,2)
-    mean_u = U.mean(dim=0)                   # (B,2)
-    C = torch.sqrt((mean_u * mean_u).sum(dim=-1) + 1e-8)  # (B,)
+    U = torch.stack(u_list, dim=0)
+    mean_u = U.mean(dim=0)
+    C = torch.sqrt((mean_u * mean_u).sum(dim=-1) + 1e-8)
     C = torch.clamp(C, 0.0, 1.0)
     return C
 
 
 # -----------------------------
-# Export: opset=13 + ir_version=9 (Cube.AI 10.2)
+# ONNX export
 # -----------------------------
 def export_onnx_ir9(model: nn.Module, out_onnx: str):
     import onnx
@@ -399,47 +438,72 @@ def export_onnx_ir9(model: nn.Module, out_onnx: str):
 
 
 # -----------------------------
-# Train pipeline (2-stage)
+# Training pipeline
 # -----------------------------
-def train_and_export(sim_csv_path: str,
-                     exp_csv_path: str,
-                     out_onnx: str,
-                     epochs_a: int = 60,
-                     epochs_b: int = 30,
-                     batch_size: int = 64,
-                     lr_a: float = 1e-3,
-                     lr_b: float = 5e-4,
-                     hidden: int = 32,
-                     dropout_p: float = 0.15,
-                     seed: int = 42,
-                     M_mc: int = 16,
-                     noise_std: float = 0.02,
-                     noise_clip: float = 0.06):
-
+def train_and_export(
+    sim_csv_path: str,
+    exp_csv_path: str,
+    out_onnx: str,
+    epochs_a: int = 60,
+    epochs_b: int = 30,
+    batch_size: int = 64,
+    lr_a: float = 1e-3,
+    lr_b: float = 5e-4,
+    hidden: int = 32,
+    dropout_p: float = 0.15,
+    seed: int = 42,
+    M_mc: int = 16,
+    noise_std: float = 0.02,
+    noise_clip: float = 0.06,
+    target_x_mm: float = 0.0,
+    target_y_mm: float = 0.0,
+    alpha_max_cm: float = 3.0,
+):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # 数据准备：用【仿真数据】训练
+    # -------------------------
+    # prepare simulation data
+    # -------------------------
     df_raw = parse_sim_csv(sim_csv_path)
     print("[SIM] parsed rows:", len(df_raw))
+
     grid = build_grid(df_raw)
     print("[SIM] grid points:", len(grid))
 
     grid_g = finite_difference_gradient(grid, field_col="vavg")
     data = compute_features(grid_g)
 
-    # 标签：dir_gt 来自有限差分梯度；alpha_gt 启发式
+    # labels
     dir_gt = data[["gx", "gy"]].to_numpy(dtype=np.float32)
     dir_gt = dir_gt / (np.linalg.norm(dir_gt, axis=1, keepdims=True) + 1e-12)
-    alpha_gt = compute_step_label(data).to_numpy(dtype=np.float32)
 
-    # 输入特征
+    # Revised alpha label: alpha*=min(||p*-pk||, alpha_max)
+    alpha_gt = compute_step_label_from_position(
+        data,
+        target_x=target_x_mm,
+        target_y=target_y_mm,
+        alpha_max_cm=alpha_max_cm,
+        coord_unit="mm",
+    ).to_numpy(dtype=np.float32)
+
+    # inputs
     X = data[["sx", "sy", "vavg", "dsx", "dsy"]].to_numpy(dtype=np.float32)
 
-    ok = np.isfinite(X).all(axis=1) & np.isfinite(dir_gt).all(axis=1) & np.isfinite(alpha_gt)
+    ok = (
+        np.isfinite(X).all(axis=1)
+        & np.isfinite(dir_gt).all(axis=1)
+        & np.isfinite(alpha_gt)
+    )
     X, dir_gt, alpha_gt = X[ok], dir_gt[ok], alpha_gt[ok]
+
     if len(X) < 50:
         raise RuntimeError(f"有效样本太少：{len(X)}")
+
+    print("[LABEL] alpha target generated by positional distance.")
+    print(f"[LABEL] target p* = ({target_x_mm:.3f} mm, {target_y_mm:.3f} mm)")
+    print(f"[LABEL] alpha_max = {alpha_max_cm:.3f} cm")
+    print(f"[LABEL] alpha_gt range = [{alpha_gt.min():.4f}, {alpha_gt.max():.4f}] cm")
 
     # train/val split
     idx = np.arange(len(X))
@@ -447,44 +511,66 @@ def train_and_export(sim_csv_path: str,
     n_train = int(0.9 * len(X))
     tr, va = idx[:n_train], idx[n_train:]
 
-    # 归一化（基于仿真训练集）
+    # normalization
     stats = compute_norm_stats(X[tr])
     Xn = apply_norm(X, stats).astype(np.float32)
-    np.savez(out_onnx + ".norm.npz",
-             mean=stats.mean.astype(np.float32),
-             std=stats.std.astype(np.float32))
 
-    # ============= 零点偏移校准：用【实验数据】估计 offset，并保存 =============
-    # 对齐仿真与实验在特征空间的均值（只校准 sx, sy, vavg 这3个“零点”）
+    np.savez(
+        out_onnx + ".norm.npz",
+        mean=stats.mean.astype(np.float32),
+        std=stats.std.astype(np.float32),
+    )
+
+    # Save alpha-label metadata for reproducibility
+    np.savez(
+        out_onnx + ".alpha_meta.npz",
+        target_x_mm=np.array([target_x_mm], dtype=np.float32),
+        target_y_mm=np.array([target_y_mm], dtype=np.float32),
+        alpha_max_cm=np.array([alpha_max_cm], dtype=np.float32),
+        alpha_min_cm=np.array([alpha_gt.min()], dtype=np.float32),
+        alpha_max_observed_cm=np.array([alpha_gt.max()], dtype=np.float32),
+        note=np.array(
+            ["alpha* = min(||p* - pk||, alpha_max), generated in cm from simulation x/y in mm"],
+            dtype=object,
+        ),
+    )
+
+    # -------------------------
+    # zero-offset calibration using experimental data
+    # -------------------------
     try:
         df_exp_raw = parse_serial_debug(exp_csv_path)
         grid_exp = build_grid(df_exp_raw)
         data_exp = compute_features(grid_exp)
 
-        X_exp_raw = data_exp[["sx","sy","vavg","dsx","dsy"]].to_numpy(dtype=np.float32)
-        X_sim_raw = data[["sx","sy","vavg","dsx","dsy"]].to_numpy(dtype=np.float32)
+        X_exp_raw = data_exp[["sx", "sy", "vavg", "dsx", "dsy"]].to_numpy(dtype=np.float32)
+        X_sim_raw = data[["sx", "sy", "vavg", "dsx", "dsy"]].to_numpy(dtype=np.float32)
 
         sim_mean = np.nanmean(X_sim_raw[:, :3], axis=0)
         exp_mean = np.nanmean(X_exp_raw[:, :3], axis=0)
         offset3 = (exp_mean - sim_mean).astype(np.float32)
         offset5 = np.array([offset3[0], offset3[1], offset3[2], 0.0, 0.0], dtype=np.float32)
 
-        np.savez(out_onnx + ".offset.npz",
-                 offset=offset5,
-                 offset_sx=offset3[0],
-                 offset_sy=offset3[1],
-                 offset_vavg=offset3[2],
-                 method="mean_align_sim",
-                 sim_mean_3=sim_mean.astype(np.float32),
-                 exp_mean_3=exp_mean.astype(np.float32))
+        np.savez(
+            out_onnx + ".offset.npz",
+            offset=offset5,
+            offset_sx=offset3[0],
+            offset_sy=offset3[1],
+            offset_vavg=offset3[2],
+            method="mean_align_sim",
+            sim_mean_3=sim_mean.astype(np.float32),
+            exp_mean_3=exp_mean.astype(np.float32),
+        )
 
         print("\n[CALIB] 已保存零点偏移:", out_onnx + ".offset.npz")
         print("[CALIB] offset[sx,sy,vavg] =", offset3)
     except Exception as e:
-        print("\n[CALIB] 实验数据零点校准失败（将继续训练/导出，不影响模型生成）:")
+        print("\n[CALIB] 实验数据零点校准失败（继续训练/导出，不影响模型生成）:")
         print("        ", repr(e))
 
-    # ============= Stage-A: train dir + alpha =============
+    # -------------------------
+    # Stage-A: train direction + alpha
+    # -------------------------
     ds_tr_a = AlignDatasetA(Xn[tr], dir_gt[tr], alpha_gt[tr])
     ds_va_a = AlignDatasetA(Xn[va], dir_gt[va], alpha_gt[va])
     dl_tr_a = DataLoader(ds_tr_a, batch_size=batch_size, shuffle=True, drop_last=False)
@@ -493,10 +579,11 @@ def train_and_export(sim_csv_path: str,
     model = AlignNetY4_MC(in_dim=5, hidden=hidden, dropout_p=dropout_p)
     opt_a = torch.optim.Adam(model.parameters(), lr=lr_a)
 
-    print("\n[Stage-A] train direction + alpha ...")
+    print("\n[Stage-A] train direction + alpha.")
     for ep in range(1, epochs_a + 1):
         model.train()
         tr_loss = 0.0
+
         for xb, dgb, agb in dl_tr_a:
             dir_pred, alpha_pred = model.forward_dir_alpha(xb)
             loss = loss_stage_a(dir_pred, alpha_pred, dgb, agb)
@@ -504,6 +591,7 @@ def train_and_export(sim_csv_path: str,
             loss.backward()
             opt_a.step()
             tr_loss += float(loss.item()) * xb.size(0)
+
         tr_loss /= max(1, len(ds_tr_a))
 
         model.eval()
@@ -513,28 +601,38 @@ def train_and_export(sim_csv_path: str,
                 dir_pred, alpha_pred = model.forward_dir_alpha(xb)
                 loss = loss_stage_a(dir_pred, alpha_pred, dgb, agb)
                 va_loss += float(loss.item()) * xb.size(0)
+
         va_loss /= max(1, len(ds_va_a))
 
         if ep == 1 or ep % 10 == 0 or ep == epochs_a:
             print(f"EpochA {ep:3d} | train={tr_loss:.6f} | val={va_loss:.6f}")
 
-    # ============= Stage-B: build MC confidence targets, then train c_head =============
-    print("\n[Stage-B] build MC confidence targets (C) ...")
+    # -------------------------
+    # Stage-B: build MC confidence targets and train c_head
+    # -------------------------
+    print("\n[Stage-B] build MC confidence targets (C).")
     X_tensor = torch.from_numpy(Xn).float()
     C_all = []
     bs_mc = 256
+
     for i in range(0, X_tensor.size(0), bs_mc):
         xb = X_tensor[i:i + bs_mc]
         Cb = mc_confidence_C(model, xb, M=M_mc, noise_std=noise_std, noise_clip=noise_clip)
         C_all.append(Cb.cpu().numpy())
+
     C_all = np.concatenate(C_all, axis=0).astype(np.float32)
 
-    # 训练 c_head：冻结 trunk/dir/alpha，只训练 head_conf
-    for p in model.fc1.parameters(): p.requires_grad = False
-    for p in model.fc2.parameters(): p.requires_grad = False
-    for p in model.head_dir.parameters(): p.requires_grad = False
-    for p in model.head_alpha.parameters(): p.requires_grad = False
-    for p in model.head_conf.parameters(): p.requires_grad = True
+    # freeze trunk/dir/alpha, train only head_conf
+    for p in model.fc1.parameters():
+        p.requires_grad = False
+    for p in model.fc2.parameters():
+        p.requires_grad = False
+    for p in model.head_dir.parameters():
+        p.requires_grad = False
+    for p in model.head_alpha.parameters():
+        p.requires_grad = False
+    for p in model.head_conf.parameters():
+        p.requires_grad = True
 
     ds_tr_b = AlignDatasetB(Xn[tr], C_all[tr])
     ds_va_b = AlignDatasetB(Xn[va], C_all[va])
@@ -543,90 +641,101 @@ def train_and_export(sim_csv_path: str,
 
     opt_b = torch.optim.Adam(model.head_conf.parameters(), lr=lr_b)
 
-    print("[Stage-B] train confidence head ...")
+    print("[Stage-B] train confidence head.")
     for ep in range(1, epochs_b + 1):
         model.train()
         tr_loss = 0.0
+
         for xb, cb in dl_tr_b:
-            h = model.trunk(xb)
-            c_pred = torch.sigmoid(model.head_conf(h))
+            y = model(xb)
+            c_pred = y[:, 3]
             loss = loss_stage_b(c_pred, cb)
             opt_b.zero_grad()
             loss.backward()
             opt_b.step()
             tr_loss += float(loss.item()) * xb.size(0)
+
         tr_loss /= max(1, len(ds_tr_b))
 
         model.eval()
         va_loss = 0.0
         with torch.no_grad():
             for xb, cb in dl_va_b:
-                h = model.trunk(xb)
-                c_pred = torch.sigmoid(model.head_conf(h))
+                y = model(xb)
+                c_pred = y[:, 3]
                 loss = loss_stage_b(c_pred, cb)
                 va_loss += float(loss.item()) * xb.size(0)
+
         va_loss /= max(1, len(ds_va_b))
 
-        if ep == 1 or ep % 5 == 0 or ep == epochs_b:
+        if ep == 1 or ep % 10 == 0 or ep == epochs_b:
             print(f"EpochB {ep:3d} | train={tr_loss:.6f} | val={va_loss:.6f}")
 
+    # -------------------------
+    # export
+    # -------------------------
     export_onnx_ir9(model, out_onnx)
-    print(f"\nExported for Cube.AI: {out_onnx}")
-    print(f"Saved norm stats: {out_onnx}.norm.npz")
-    print("输出 y(1,4)=[dir_x, dir_y, alpha, conf]")
-    print("注意：MCU 端推理前必须对输入做 (x-mean)/std 归一化。")
+
+    print("\n[OK] Exported ONNX:", out_onnx)
+    print("[OK] Saved norm:      ", out_onnx + ".norm.npz")
+    print("[OK] Saved offset:    ", out_onnx + ".offset.npz (if calibration succeeded)")
+    print("[OK] Saved alpha meta:", out_onnx + ".alpha_meta.npz")
+    print("ONNX input : x shape=(1,5)")
+    print("ONNX output: y shape=(1,4) => [dir_x, dir_y, alpha_cm, c]")
 
 
-def main():
+# -----------------------------
+# CLI
+# -----------------------------
+def build_argparser():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sim", type=str, default=None, help="仿真数据CSV")
-    ap.add_argument("--exp", type=str, default=None, help="实验数据CSV(用于零点校准)")
-    ap.add_argument("--out", type=str, default=OUT_ONNX_DEFAULT)
+    ap.add_argument("--sim_csv", type=str, default=SIM_CSV_DEFAULT, help="simulation csv path")
+    ap.add_argument("--exp_csv", type=str, default=EXP_CSV_DEFAULT, help="experimental csv path")
+    ap.add_argument("--out_onnx", type=str, default=OUT_ONNX_DEFAULT, help="output onnx path")
 
     ap.add_argument("--epochs_a", type=int, default=60)
     ap.add_argument("--epochs_b", type=int, default=30)
-
-    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--lr_a", type=float, default=1e-3)
     ap.add_argument("--lr_b", type=float, default=5e-4)
     ap.add_argument("--hidden", type=int, default=32)
-    ap.add_argument("--dropout", type=float, default=0.15)
+    ap.add_argument("--dropout_p", type=float, default=0.15)
+    ap.add_argument("--seed", type=int, default=42)
 
-    ap.add_argument("--M", type=int, default=16, help="MC repeats for confidence")
+    ap.add_argument("--M_mc", type=int, default=16)
     ap.add_argument("--noise_std", type=float, default=0.02)
     ap.add_argument("--noise_clip", type=float, default=0.06)
 
-    args = ap.parse_args()
+    # revised alpha-label arguments
+    ap.add_argument("--target_x_mm", type=float, default=0.0, help="target x position p* in mm")
+    ap.add_argument("--target_y_mm", type=float, default=0.0, help="target y position p* in mm")
+    ap.add_argument("--alpha_max_cm", type=float, default=3.0, help="max step size alpha_max in cm")
 
-    sim_csv = args.sim if args.sim else SIM_CSV_DEFAULT
-    exp_csv = args.exp if args.exp else EXP_CSV_DEFAULT
-    if not sim_csv or not os.path.exists(sim_csv):
-        raise FileNotFoundError(
-            "没有找到仿真 CSV。\n"
-            "方法1：python 脚本.py --sim R=140三维.csv --exp sss.csv\n"
-            f"方法2：修改脚本顶部 SIM_CSV_DEFAULT（当前：{SIM_CSV_DEFAULT}）"
-        )
-    if not exp_csv or not os.path.exists(exp_csv):
-        print("[WARN] 没有找到实验CSV，将跳过零点校准：", exp_csv)
+    return ap
+
+
+def main():
+    args = build_argparser().parse_args()
 
     train_and_export(
-        sim_csv_path=sim_csv,
-        exp_csv_path=exp_csv,
-        out_onnx=args.out,
+        sim_csv_path=args.sim_csv,
+        exp_csv_path=args.exp_csv,
+        out_onnx=args.out_onnx,
         epochs_a=args.epochs_a,
         epochs_b=args.epochs_b,
-        batch_size=args.batch,
+        batch_size=args.batch_size,
         lr_a=args.lr_a,
         lr_b=args.lr_b,
         hidden=args.hidden,
-        dropout_p=args.dropout,
-        M_mc=args.M,
+        dropout_p=args.dropout_p,
+        seed=args.seed,
+        M_mc=args.M_mc,
         noise_std=args.noise_std,
         noise_clip=args.noise_clip,
+        target_x_mm=args.target_x_mm,
+        target_y_mm=args.target_y_mm,
+        alpha_max_cm=args.alpha_max_cm,
     )
-    d = np.load(args.out + ".norm.npz")
-    print("MEAN =", d["mean"])
-    print("STD  =", d["std"])
 
 
 if __name__ == "__main__":
